@@ -119,6 +119,14 @@ public class OrderService {
         }).exceptionally(e -> reassembleIfResolvable(e, CheckoutResponse.class));
     }
 
+    public static void main(String[] args) {
+        final LocalDateTime now = LocalDateTime.now();
+        System.out.println(now);
+        //默认失效时间是往后推迟5秒
+        System.out.println(now.plusSeconds(RESERVING_IN_SECS));
+        System.out.println(now.plusSeconds(RESERVING_IN_SECS).isBefore(now));
+    }
+
     public CompletableFuture<OrderState> doCheckout(@Nonnull CheckoutRequest request) {
         Objects.requireNonNull(request);
         // check if exists the corresponding GUID for idempotency
@@ -126,35 +134,37 @@ public class OrderService {
         final Order order = orderMapper.selectByGuid(guid);
         final CompletableFuture<OrderState> response;
         if (order != null) {
-            LOGGER.debug("method doCheckout. recovering order that guid is '{}' and order is '{}'", guid, order);
+            LOGGER.debug("订单检查，订单已经存在，订单参数为：guid: {} order :{}'", guid, order);
             final OrderState persistedState = order.getState();
             Preconditions.checkArgument(persistedState != OrderState.INVALID);
             if (persistedState.isFinalState()) {
-                LOGGER.debug("method doCheckout. guid '{}' order has already been a final state...", guid);
+                LOGGER.debug("订单检查，订单已经完成，guid：{}", guid);
                 return CompletableFuture.completedFuture(persistedState);
             }
             Preconditions.checkArgument(persistedState == OrderState.PENDING);
-            // check expired time first
+            //检查过期时间，以防在5秒内连续提交，就会进入下面的判断。
             if (order.getExpireAt().isBefore(LocalDateTime.now())) {
-                // try reserving
-                LOGGER.debug("method doCheckout. recovering and reserving order, guid '{}'", guid);
+                //如果失效时间 > 现在时间   =  true
+                LOGGER.debug("订单已经超出失效时间，回收和保留订单, guid '{}'", guid);
                 response = CompletableFuture.completedFuture(order)
                     .thenCompose(x -> beginTccTransaction(x.getId(), request));
             } else {
+                //订单未超出失效时间
                 final Long orderId = order.getId();
-                // just make it TIMEOUT final state and let participants cancel-automatically
+                // 只需将其设置为超时最终状态并让参与者自动取消即可
                 OrderState state = OrderState.CANCELLED;
+                //通过CAS比较替换算法进行修改操作，把处理中的订单修改为已超时
                 if (orderMapper.compareAndSetState(orderId, OrderState.PENDING, OrderState.CANCELLED) <= 0) {
-                    // ATTENTION: u should force to retrieve from master node in production environment.
-                    state = orderMapper.selectByPrimaryKey(orderId).getState();
+                    //注意:在生产环境中，你应该强制从主节点进行检索。
+                    state = orderMapper.selectByPrimaryKey(orderId).getState(); //此处查询出来state等于2 ，交易超时
                 } else {
                     LOGGER.debug("method doCheckout. the order of guid '{}' was cancelled", guid);
                 }
                 response = CompletableFuture.completedFuture(state);
             }
         } else {
-            // new beginning for a new order
-            LOGGER.debug("method doCheckout. new tcc transaction for guid '{}'", guid);
+            // 创建新订单
+            LOGGER.debug("订单检查，创建新的订单，开始Tcc事务，业务就是在Tcc事务中做的，guid '{}'", guid);
             response = generatePendingOrder(request)
                 .thenCompose(x -> beginTccTransaction(x.getId(), request));
         }
@@ -179,41 +189,52 @@ public class OrderService {
             final LocalDateTime now = LocalDateTime.now();
             order.setCreateAt(now);
             order.setUpdateAt(now);
-            order.setExpireAt(now.plusSeconds(RESERVING_IN_SECS));
-            order.setState(OrderState.PENDING);
+            order.setExpireAt(now.plusSeconds(RESERVING_IN_SECS));         //默认失效时间是往后推迟5秒
+            order.setState(OrderState.PENDING);         //处理中
             orderMapper.insertSelective(order);
             LOGGER.debug("method generatePendingOrder. persist a new order '{}'", order);
             return order;
         }, Pools.IO);
     }
 
+    //创建好订单后，开始事务去处理业务操作。（采用Tcc事务处理业务）
     CompletableFuture<OrderState> beginTccTransaction(long orderId, CheckoutRequest request) {
         // try reserving
         final String username = request.getUsername();
         final String productName = request.getProductName();
         final Integer price = request.getPrice();
         final Integer quantity = request.getQuantity();
-        final int reservingSeconds = RESERVING_IN_SECS + COMPENSATION_IN_SECS;
+        final int reservingSeconds = RESERVING_IN_SECS + COMPENSATION_IN_SECS;      //事务预留8秒失效时间，也就是说，confirm必须要在8秒内处理完毕
         final CompletableFuture<BalanceReservingResponse> accountReservingResponse =
-            accountClient.reservingBalance(username, orderId, price, reservingSeconds);
+            accountClient.reservingBalance(username, orderId, price, reservingSeconds); //计算余额到事务表t_account_transaction
         final CompletableFuture<InventoryReservingResponse> productReservingResponse =
-            productClient.reservingInventory(productName, orderId, quantity, reservingSeconds);
+            productClient.reservingInventory(productName, orderId, quantity, reservingSeconds);     //扣减库存到事务表t_product_transaction ，
+       //到此，try就全部完成了
+        LOGGER.debug("到此，try就全部完成了。。。接下来执行confirm");
+        //thenCombine的意思是同时执行完accountReservingResponse方法和productReservingResponse的方法后，执行confirmTransaction方法。
         return accountReservingResponse.thenCombine(productReservingResponse, (r1, r2) -> null)
             .thenCompose(x -> confirmTransaction(orderId, username, productName, reservingSeconds));
     }
 
+
+    //执行confirm
     private CompletableFuture<OrderState> confirmTransaction(long orderId, String username, String productName, int reservingSeconds) {
+        //thenCombine方法表示confirmAccountTransaction方法和confirmProductTransaction方法都执行完再继续执行下面的代码。
         return confirmAccountTransaction(orderId, username, reservingSeconds)
             .thenCombine(confirmProductTransaction(orderId, productName, reservingSeconds), (r1, r2) -> {
                 OrderState state;
+                //如果库存和余额事务都处理成功，state=1
                 if (NumericStatusCode.isSuccessful(r1.getCode()) && NumericStatusCode.isSuccessful(r2.getCode())) {
                     state = OrderState.CONFIRMED;
+                //如果余额事务和库存事务都超时 ，state=2  交易超时
                 } else if (Objects.equals(com.github.prontera.account.enums.StatusCode.TIMEOUT_AND_CANCELLED.code(), r1.getCode()) &&
                     Objects.equals(com.github.prontera.product.enums.StatusCode.TIMEOUT_AND_CANCELLED.code(), r2.getCode())) {
                     state = OrderState.CANCELLED;
+                //否则交易冲突 state=3
                 } else {
                     state = OrderState.CONFLICT;
                 }
+                //等所有任务执行完毕，通过CAS算法修改订单状态
                 if (orderMapper.compareAndSetState(orderId, OrderState.PENDING, state) <= 0) {
                     // ATTENTION: u should force to retrieve from master node in production environment.
                     state = orderMapper.selectByPrimaryKey(orderId).getState();
@@ -226,6 +247,7 @@ public class OrderService {
     }
 
     private CompletableFuture<ConfirmProductTxnResponse> confirmProductTransaction(long orderId, String productName, int reservingSeconds) {
+        //延迟8秒+1秒执行产品名为gba的列子去调用http接口。这里用来测试的。
         return CompletableFuture.runAsync(() -> {
             if (Objects.equals("gba", productName)) {
                 LockSupport.parkNanos(this, TimeUnit.SECONDS.toNanos(reservingSeconds + 1));
@@ -234,6 +256,7 @@ public class OrderService {
     }
 
     private CompletableFuture<ConfirmAccountTxnResponse> confirmAccountTransaction(long orderId, String username, int reservingSeconds) {
+        //延迟8秒+1秒执行用户名为scott的列子去调用http接口。这里用来测试的。
         return CompletableFuture.runAsync(() -> {
             if (Objects.equals("scott", username)) {
                 LockSupport.parkNanos(this, TimeUnit.SECONDS.toNanos(reservingSeconds + 1));

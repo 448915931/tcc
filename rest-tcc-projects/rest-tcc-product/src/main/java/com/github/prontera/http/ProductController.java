@@ -17,6 +17,8 @@ import com.github.prontera.util.HibernateValidators;
 import com.github.prontera.util.Responses;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.http.MediaType;
@@ -37,6 +39,8 @@ import java.util.Optional;
 @RestController
 @RequestMapping(value = "/", produces = {MediaType.APPLICATION_JSON_VALUE}, consumes = {MediaType.APPLICATION_JSON_VALUE})
 public class ProductController {
+
+    private static final Logger LOGGER = LogManager.getLogger(ProductController.class);
 
     private final ProductService service;
 
@@ -90,6 +94,7 @@ public class ProductController {
     @ApiOperation(value = "根据订单ID确认预留资源", notes = "具备fsm被动轮转能力")
     @PostMapping(value = "/confirm-transaction")
     public ConfirmProductTxnResponse confirmTransaction(@Nonnull @RequestBody ConfirmProductTxnRequest request) {
+        LOGGER.debug("Confirm库存计算进入。。。。");
         Objects.requireNonNull(request);
         HibernateValidators.throwsIfInvalid(request);
         return service.confirmTransaction(request, 0);

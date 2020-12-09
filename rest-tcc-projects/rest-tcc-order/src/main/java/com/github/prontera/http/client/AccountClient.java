@@ -110,6 +110,7 @@ public class AccountClient {
     }
 
     public CompletableFuture<ConfirmAccountTxnResponse> confirm(long orderId) {
+        LOGGER.debug("Confirm余额计算进入。。。。");
         Preconditions.checkArgument(orderId > 0);
         final ConfirmAccountTxnRequest request = new ConfirmAccountTxnRequest();
         request.setOrderId(orderId);

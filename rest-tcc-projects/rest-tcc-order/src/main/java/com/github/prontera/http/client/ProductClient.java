@@ -110,6 +110,7 @@ public class ProductClient {
     }
 
     public CompletableFuture<ConfirmProductTxnResponse> confirm(long orderId) {
+        LOGGER.debug("Confirm库存计算进入。。。。");
         Preconditions.checkArgument(orderId > 0);
         final ConfirmProductTxnRequest request = new ConfirmProductTxnRequest();
         request.setOrderId(orderId);

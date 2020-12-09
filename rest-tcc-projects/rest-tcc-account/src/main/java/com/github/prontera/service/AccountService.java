@@ -16,6 +16,8 @@ import com.github.prontera.persistence.AccountTransactionMapper;
 import com.github.prontera.util.Responses;
 import com.google.common.base.Preconditions;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
@@ -37,6 +39,8 @@ import java.util.Optional;
 public class AccountService {
 
     public static final int MAX_RETRY_CONFIRM_TIMES = 3;
+
+    private final Logger LOGGER =LogManager.getLogger(AccountService.class);
 
     private final AccountMapper mapper;
 
@@ -147,12 +151,14 @@ public class AccountService {
     }
 
     /**
+     * cancel
      * 根据orderId检索事务记录, 若发现过期, 则自动过期并回写数据源, 并响应响应新的实体
      */
     public Optional<AccountTransaction> cancellableFindTransaction(long orderId) {
         AccountTransaction transaction = transactionMapper.selectByOrderId(orderId);
         if (transaction != null) {
             final LocalDateTime now = LocalDateTime.now();
+            //事务还在处理中，并且事务的操作日期已经过期。
             if (transaction.getState() == ReservingState.TRYING && now.isAfter(transaction.getExpireAt())) {
                 transactionTemplate.execute(status -> {
                     transaction.setState(ReservingState.CANCELLED);
@@ -180,6 +186,7 @@ public class AccountService {
      * --- b. 如果已经为confirm, 则同样响应成功
      */
     public ConfirmAccountTxnResponse confirmTransaction(@Nonnull ConfirmAccountTxnRequest request, int retryTimesNow) {
+        LOGGER.debug("Confirm余额计算进入。。。。");
         Objects.requireNonNull(request);
         // exit for fallback preventing infinity loop
         if (retryTimesNow > MAX_RETRY_CONFIRM_TIMES) {

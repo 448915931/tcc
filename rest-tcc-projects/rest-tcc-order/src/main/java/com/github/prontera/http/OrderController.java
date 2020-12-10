@@ -50,6 +50,7 @@ public class OrderController {
             .subscribeOn(Schedulers.fromExecutorService(Pools.IO));
     }
 
+    //如果订单出现故障，那么使用这个方法可以看出是product出现问题还是account出现问题。
     @FaultBarrier
     @ApiOperation(value = "诊断订单", notes = "_")
     @PostMapping(value = "/diagnose")
